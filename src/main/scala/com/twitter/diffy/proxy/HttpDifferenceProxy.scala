@@ -73,9 +73,9 @@ object SimpleHttpDifferenceProxy {
 }
 
 class ResponseData {
-  var primaryMessage: Message = null
-  var secondaryMessage: Message = null
-  var candidateMessage: Message = null
+  var primaryMessage: Try[Message] = null
+  var secondaryMessage: Try[Message] = null
+  var candidateMessage: Try[Message] = null
 }
 
 /**
@@ -138,16 +138,17 @@ case class SimpleHttpDifferenceProxy(
           case Return(_) => log.info("success networking")
           case Throw(t) => log.info(t, "error networking")
         }
-      val responses: Future[Seq[Message]] =
-        rawResponses flatMap { reps =>
-          Future.collect(reps map liftResponse) respond {
-            case Return(rs) =>
-              log.info(s"success lifting ${rs.head.endpoint}")
-
-            case _ => log.info("error lifting" )
-          }
-        }
       try {
+        val responses: Future[Seq[Message]] =
+          rawResponses flatMap { reps =>
+            Future.collect(reps map liftResponse) respond {
+              case Return(rs) =>
+                log.info(s"success lifting ${rs.head.endpoint}")
+
+              case Throw(t) => log.info("error lifting", t)
+            }
+          }
+
         if (!uniqueReqRespMap.contains(uniqueReqId)) {
           uniqueReqRespMap.put(uniqueReqId, new ResponseData())
         }
@@ -156,21 +157,21 @@ case class SimpleHttpDifferenceProxy(
 
         if (clientType == "primary") {
           log.debug("Before getting message ")
-          responseList.primaryMessage = Await.result(responses).head
+          responseList.primaryMessage = Try(Await.result(responses).head)
         } else if (clientType == "candidate") {
           log.debug("Before getting message ")
-          responseList.candidateMessage = Await.result(responses).head
+          responseList.candidateMessage = Try(Await.result(responses).head)
         } else if (clientType == "secondary") {
           log.debug("Before getting message ")
-          responseList.secondaryMessage = Await.result(responses).head
+          responseList.secondaryMessage = Try(Await.result(responses).head)
         }
 
         log.debug("Current Map Size" + uniqueReqRespMap.size)
 
-        if (uniqueReqRespMap.get(uniqueReqId).get.primaryMessage  != null &&
-            uniqueReqRespMap.get(uniqueReqId).get.candidateMessage != null && 
-            uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage != null) {
-          val responseSeq = Seq(uniqueReqRespMap.get(uniqueReqId).get.primaryMessage, uniqueReqRespMap.get(uniqueReqId).get.candidateMessage, uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage)
+        if (uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.get() != null &&
+          uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.get() != null &&
+          uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage != null) {
+          val responseSeq = Seq(uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.get(), uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.get(), uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage.get())
           log.info("comparing for Response seq:" + uniqueReqId)
           val liftedResponse: Future[Seq[Message]] = Future.value(responseSeq)
 
