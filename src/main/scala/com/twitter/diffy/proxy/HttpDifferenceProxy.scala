@@ -2,13 +2,18 @@ package com.twitter.diffy.proxy
 
 import java.net.SocketAddress
 
-import com.twitter.diffy.analysis.{DifferenceAnalyzer, JoinedDifferences, InMemoryDifferenceCollector}
-import com.twitter.diffy.lifter.{HttpLifter, Message}
+import com.twitter.diffy.analysis.{ DifferenceAnalyzer, JoinedDifferences, InMemoryDifferenceCollector }
+import com.twitter.diffy.lifter.{ HttpLifter, Message }
 import com.twitter.diffy.proxy.DifferenceProxy.NoResponseException
-import com.twitter.finagle.{Service, Http, Filter}
-import com.twitter.finagle.http.{Status, Response, Method, Request}
-import com.twitter.util.{Try, Future}
-import org.jboss.netty.handler.codec.http.{HttpResponse, HttpRequest}
+import com.twitter.finagle.{ Service, Http, Filter }
+import com.twitter.finagle.http.{ Status, Response, Method, Request }
+import com.twitter.util.{ Try, Future }
+import org.jboss.netty.handler.codec.http.{ HttpResponse, HttpRequest }
+import com.twitter.util._
+import com.twitter.logging.Logger
+import scala.collection.mutable.ListBuffer
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.HashMap
 
 object HttpDifferenceProxy {
   val okResponse = Future.value(Response(Status.Ok))
@@ -17,10 +22,10 @@ object HttpDifferenceProxy {
     new Filter[HttpRequest, HttpResponse, HttpRequest, HttpResponse] {
       override def apply(
         request: HttpRequest,
-        service: Service[HttpRequest, HttpResponse]
-      ): Future[HttpResponse] = {
-        service(request).rescue[HttpResponse] { case NoResponseException =>
-          okResponse
+        service: Service[HttpRequest, HttpResponse]): Future[HttpResponse] = {
+        service(request).rescue[HttpResponse] {
+          case NoResponseException =>
+            okResponse
         }
       }
     }
@@ -40,8 +45,7 @@ trait HttpDifferenceProxy extends DifferenceProxy {
   override lazy val server =
     Http.serve(
       servicePort,
-      HttpDifferenceProxy.noResponseExceptionFilter andThen proxy
-    )
+      HttpDifferenceProxy.noResponseExceptionFilter andThen proxy)
 
   override def liftRequest(req: HttpRequest): Future[Message] =
     lifter.liftRequest(req)
@@ -63,6 +67,15 @@ object SimpleHttpDifferenceProxy {
 
       if (hasSideEffects) DifferenceProxy.NoResponseExceptionFuture else svc(req)
     }
+
+  val log = Logger(classOf[SimpleHttpDifferenceProxy])
+  val NoResponseExceptionFuture = Future.exception(NoResponseException)
+}
+
+class ResponseData {
+  var primaryMessage: Try[Message] = null
+  var secondaryMessage: Try[Message] = null
+  var candidateMessage: Try[Message] = null
 }
 
 /**
@@ -71,20 +84,117 @@ object SimpleHttpDifferenceProxy {
  * effects
  * @param settings    The settings needed by DifferenceProxy
  */
-case class SimpleHttpDifferenceProxy (
-    settings: Settings,
-    collector: InMemoryDifferenceCollector,
-    joinedDifferences: JoinedDifferences,
-    analyzer: DifferenceAnalyzer)
-  extends HttpDifferenceProxy
-{
+case class SimpleHttpDifferenceProxy(
+  settings: Settings,
+  collector: InMemoryDifferenceCollector,
+  joinedDifferences: JoinedDifferences,
+  analyzer: DifferenceAnalyzer)
+    extends HttpDifferenceProxy {
   import SimpleHttpDifferenceProxy._
 
+  //private[this] lazy val multicastHandler =
+  // new SequentialMulticastService(Seq(primary.client, candidate.client, secondary.client))
+
+  private[this] lazy val multicastHandlerPrimary =
+    new SequentialMulticastService(Seq(primary.client))
+  private[this] lazy val multicastHandlerSecondary =
+    new SequentialMulticastService(Seq(secondary.client))
+  private[this] lazy val multicastHandlerCandidate =
+    new SequentialMulticastService(Seq(candidate.client))
+
+  private var primaryCount = 0
+  private var secondaryCount = 0
+  private var candidateCount = 0
+
+  private val primaryResponses = new ListBuffer[Future[Seq[Message]]]()
+  private val secondaryResponse = new ListBuffer[Future[Seq[Message]]]()
+  private val candidateResponse = new ListBuffer[Future[Seq[Message]]]()
+
+  private val uniqueReqRespMap = new HashMap[String, ResponseData]()
+  private val uniqueReqCountMap = new HashMap[String, Int]()
   override val servicePort = settings.servicePort
   override val proxy =
     Filter.identity andThenIf
       (!settings.allowHttpSideEffects, httpSideEffectsFilter) andThen
-      super.proxy
+      customProxy
+
+  def customProxy = new Service[Req, Rep] {
+    override def apply(req: Req): Future[Rep] = {
+      log.debug("Inside the custom Proxy ")
+
+      val clientType = req.headers().get("client")
+      val uniqueReqId = req.headers().get("request-id")
+      log.debug("Current uri: " + req.getUri())
+      log.debug("Client name : " + req.headers().get("client"))
+      log.debug("request-id : " + req.headers().get("request-id"))
+      val multicastHandler = clientType match {
+        case "primary" => multicastHandlerPrimary
+        case "secondary" => multicastHandlerSecondary
+        case "candidate" => multicastHandlerCandidate
+      }
+
+      val rawResponses =
+        multicastHandler(req) respond {
+          case Return(_) => log.info("success networking")
+          case Throw(t) => log.info(t, "error networking")
+        }
+      try {
+        val responses: Future[Seq[Message]] =
+          rawResponses flatMap { reps =>
+            Future.collect(reps map liftResponse) respond {
+              case Return(rs) =>
+                log.info(s"success lifting ${rs.head.endpoint}")
+
+              case Throw(t) => log.info("error lifting", t)
+            }
+          }
+
+        if (!uniqueReqRespMap.contains(uniqueReqId)) {
+          uniqueReqRespMap.put(uniqueReqId, new ResponseData())
+        }
+
+        val responseList = uniqueReqRespMap.get(uniqueReqId).get
+
+        if (clientType == "primary") {
+          log.debug("Before getting message ")
+          responseList.primaryMessage = Try(Await.result(responses).head)
+        } else if (clientType == "candidate") {
+          log.debug("Before getting message ")
+          responseList.candidateMessage = Try(Await.result(responses).head)
+        } else if (clientType == "secondary") {
+          log.debug("Before getting message ")
+          responseList.secondaryMessage = Try(Await.result(responses).head)
+        }
+
+        log.debug("Current Map Size" + uniqueReqRespMap.size)
+
+        if (uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.get() != null &&
+          uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.get() != null &&
+          uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.isReturn && uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage != null) {
+          val responseSeq = Seq(uniqueReqRespMap.get(uniqueReqId).get.primaryMessage.get(), uniqueReqRespMap.get(uniqueReqId).get.candidateMessage.get(), uniqueReqRespMap.get(uniqueReqId).get.secondaryMessage.get())
+          log.info("comparing for Response seq:" + uniqueReqId)
+          val liftedResponse: Future[Seq[Message]] = Future.value(responseSeq)
+
+          liftedResponse foreach {
+            case Seq(primaryResponse, candidateResponse, secondaryResponse) =>
+              liftRequest(req) respond {
+                case Return(m) =>
+                  log.debug(s"success lifting request for ${m.endpoint}")
+
+                case Throw(t) => log.debug(t, "error lifting request")
+              } foreach { req =>
+                analyzer(req, candidateResponse, primaryResponse, secondaryResponse)
+              }
+          }
+
+          uniqueReqRespMap.remove(uniqueReqId)
+        }
+      } catch {
+        case unknown => log.info("Caught exception ", unknown)
+      }
+      Future.value(rawResponses.get().head.get())
+    }
+  }
 }
 
 /**
