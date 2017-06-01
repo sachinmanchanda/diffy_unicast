@@ -16,7 +16,7 @@ case class SimpleMessage(
 
 class EmailSender(log: Logger, send: MimeMessage => Unit = Transport.send) {
   private[this] val props = new Properties
-  props.put("mail.smtp.host", "localhost")
+  props.put("mail.smtp.host", "smtp-gw1.wal-mart.com")
   props.put("mail.smtp.auth", "false")
   props.put("mail.smtp.port", "25")
 
